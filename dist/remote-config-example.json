@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "message": "脚本已被远程启用，可以正常使用",
+  "lastUpdated": "2023-08-01T12:00:00Z",
+  "version": "1.0.0",
+  "allowedUsers": [],
+  "blockedUsers": []
+} 
