@@ -119,4 +119,4 @@ node build.js --no-obfuscate
 ## 🔗 相关链接
 
 - [小红书官网](https://www.xiaohongshu.com)
-- [问题反馈](https://github.com/your-username/your-repo/issues) 
+- [问题反馈](https://github.com/puyujian/XHS-YYDS/issues) 
