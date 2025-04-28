@@ -6,6 +6,10 @@
         constructor(app) {
             this.app = app;
             this.processingMessage = false; // 是否正在处理消息
+            this.messageRetryQueue = []; // 添加一个重试队列，用于存储处理失败的消息
+            this.maxRetries = 3; // 最大重试次数
+            this.retryInterval = 2000; // 重试间隔（毫秒）
+            this.retryTimeoutId = null; // 重试的定时器ID
         }
 
         /**
@@ -26,6 +30,9 @@
                     this.app.utils.logger.warn('获客工具处理器未初始化，获客工具相关功能将不可用');
                 }
 
+                // 启动重试机制
+                this.startRetryTimer();
+
                 return true;
             } catch (error) {
                 this.app.utils.logger.error('初始化消息处理模块失败', error);
@@ -41,19 +48,21 @@
             // 防止并发处理消息
             if (this.processingMessage) {
                 this.app.utils.logger.debug('正在处理其他消息，稍后处理此消息');
+                // 添加到重试队列，确保后续处理
+                this.addToRetryQueue({message, retryCount: 0});
                 return;
             }
 
             try {
                 this.processingMessage = true;
 
-                // --- FIX: Add check for config initialization ---
+                // 检查配置初始化是否完成
                 if (!this.app.config || !this.app.config.initialized) {
-                    this.app.utils.logger.warn('Config not initialized yet, skipping message processing.');
-                    this.processingMessage = false; // Release lock
+                    this.app.utils.logger.warn('配置初始化尚未完成，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
                     return;
                 }
-                // --- END FIX ---
 
                 // 记录消息类型
                 if (message.isSystemMessage) {
@@ -66,11 +75,35 @@
                 }
 
                 // 验证必要的工具和数据
-                if (!this.app.utils.sessionManager) throw new Error('会话管理器未初始化');
-                if (!this.app.core.aiService) throw new Error('AI 服务未初始化');
-                if (!this.app.core.leadGenerationHandler) throw new Error('获客工具处理器未初始化');
-                if (!this.app.core.autoReply) throw new Error('自动回复模块未初始化');
-                if (!message || !message.contactId || message.content === undefined) throw new Error('消息数据不完整');
+                if (!this.app.utils.sessionManager) {
+                    this.app.utils.logger.error('会话管理器未初始化，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
+                if (!this.app.core.aiService) {
+                    this.app.utils.logger.error('AI 服务未初始化，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
+                if (!this.app.core.leadGenerationHandler) {
+                    this.app.utils.logger.error('获客工具处理器未初始化，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
+                if (!this.app.core.autoReply) {
+                    this.app.utils.logger.error('自动回复模块未初始化，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
+                if (!message || !message.contactId || message.content === undefined) {
+                    this.app.utils.logger.error('消息数据不完整，跳过处理');
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
 
                 // [新增] 检查联系人是否有客资标签且启用了忽略功能
                 const ignoreLeadTags = this.app.config.getSetting('reply.ignoreLeadTags', false);
@@ -81,7 +114,7 @@
                     
                     if (contactElement) {
                         // 检查客资标签
-                        const { hasLeadTag, leadTagText } = this.app.utils.messageDetector.checkContactLeadTag(contactElement);
+                        const { hasLeadTag, leadTagText } = this.app.core.messageDetector.checkContactLeadTag(contactElement);
                         
                         if (hasLeadTag) {
                             this.app.utils.logger.info(`跳过处理带有客资标签(${leadTagText})的联系人消息: ${message.contactId}`);
@@ -344,9 +377,95 @@
 
             } catch (error) {
                 this.app.utils.logger.error('处理消息失败', error);
+                // 添加到重试队列
+                this.addToRetryQueue({message, retryCount: 0});
             } finally {
                 this.processingMessage = false;
             }
+        }
+
+        /**
+         * 添加消息到重试队列
+         * @param {Object} retryData 包含消息和重试次数的对象
+         */
+        addToRetryQueue(retryData) {
+            // 检查是否已经在队列中
+            const existingIndex = this.messageRetryQueue.findIndex(item => 
+                item.message.id === retryData.message.id);
+            
+            if (existingIndex >= 0) {
+                // 更新已存在的条目
+                this.messageRetryQueue[existingIndex].retryCount = Math.max(
+                    this.messageRetryQueue[existingIndex].retryCount,
+                    retryData.retryCount
+                );
+                this.app.utils.logger.debug(`更新重试队列中的消息，ID: ${retryData.message.id}，重试次数: ${this.messageRetryQueue[existingIndex].retryCount}`);
+            } else {
+                // 添加新条目
+                this.messageRetryQueue.push(retryData);
+                this.app.utils.logger.debug(`将消息添加到重试队列，ID: ${retryData.message.id}，重试次数: ${retryData.retryCount}`);
+            }
+        }
+
+        /**
+         * 启动重试计时器
+         */
+        startRetryTimer() {
+            if (this.retryTimeoutId) {
+                clearTimeout(this.retryTimeoutId);
+            }
+
+            this.retryTimeoutId = setTimeout(() => {
+                this.processRetryQueue();
+            }, this.retryInterval);
+        }
+
+        /**
+         * 处理重试队列中的消息
+         */
+        async processRetryQueue() {
+            if (this.messageRetryQueue.length === 0) {
+                // 队列为空，继续等待
+                this.startRetryTimer();
+                return;
+            }
+
+            if (this.processingMessage) {
+                // 当前正在处理消息，稍后再试
+                this.app.utils.logger.debug('当前正在处理消息，延迟处理重试队列');
+                this.startRetryTimer();
+                return;
+            }
+
+            // 取出第一个待重试的消息
+            const retryData = this.messageRetryQueue.shift();
+            
+            // 检查重试次数
+            if (retryData.retryCount >= this.maxRetries) {
+                this.app.utils.logger.warn(`消息 ${retryData.message.id} 已达到最大重试次数 ${this.maxRetries}，放弃处理`);
+                // 继续处理下一个消息
+                this.startRetryTimer();
+                return;
+            }
+
+            // 更新重试次数
+            retryData.retryCount++;
+            
+            this.app.utils.logger.info(`尝试重新处理消息，ID: ${retryData.message.id}，重试次数: ${retryData.retryCount}/${this.maxRetries}`);
+            
+            // 尝试处理消息
+            try {
+                await this.handleMessage(retryData.message);
+            } catch (error) {
+                this.app.utils.logger.error(`重试处理消息失败，ID: ${retryData.message.id}`, error);
+                // 如果还没达到最大重试次数，重新加入队列
+                if (retryData.retryCount < this.maxRetries) {
+                    this.addToRetryQueue(retryData);
+                }
+            }
+
+            // 继续处理队列中的下一个消息
+            this.startRetryTimer();
         }
 
         /**

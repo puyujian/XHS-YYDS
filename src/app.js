@@ -13,46 +13,81 @@
         // 添加远程控制引用
         remoteController: null,
         settings: null,
-        followUpManager: null
+        followUpManager: null,
+        // 添加初始化状态标记
+        initializing: false,
+        startupErrors: [],
+        componentStatus: {}
     };
 
     // 初始化函数
     async function initialize() {
+        // 防止重复初始化
+        if (app.initializing) {
+            console.log('初始化已在进行中，请等待...');
+            return false;
+        }
+        if (app.initialized) {
+            console.log('已经初始化完成，无需重复初始化');
+            return true;
+        }
+
+        app.initializing = true;
+        app.startupErrors = [];
+        app.componentStatus = {
+            utils: false,
+            config: false,
+            remoteControl: false,
+            core: false,
+            ui: false
+        };
+
         try {
             console.log('小红书私信自动回复助手: 正在初始化...');
 
             // 1. 加载工具类
             const utilsLoaded = await loadUtils();
             if (!utilsLoaded) {
+                app.startupErrors.push('工具类加载失败');
                 throw new Error('工具类加载失败');
             }
+            app.componentStatus.utils = true;
 
             // 2. 加载配置
             const configLoaded = await loadConfig();
             if (!configLoaded) {
+                app.startupErrors.push('配置加载失败');
                 throw new Error('配置加载失败');
             }
+            app.componentStatus.config = true;
 
             // 3. 加载远程控制模块
             const remoteControlLoaded = await loadRemoteControl();
             if (!remoteControlLoaded) {
                 app.utils.logger.warn('远程控制模块加载失败，将使用本地控制');
+            } else {
+                app.componentStatus.remoteControl = true;
             }
 
             // 4. 加载核心功能
             const coreLoaded = await loadCore();
             if (!coreLoaded) {
+                app.startupErrors.push('核心功能加载失败');
                 throw new Error('核心功能加载失败');
             }
+            app.componentStatus.core = true;
 
             // 5. 加载UI
             const uiLoaded = await loadUI();
             if (!uiLoaded) {
+                app.startupErrors.push('UI加载失败');
                 throw new Error('UI加载失败');
             }
+            app.componentStatus.ui = true;
 
             // 6. 初始化完成
             app.initialized = true;
+            app.initializing = false;
             app.utils.logger.info('初始化完成');
 
             // 7. 检查远程控制状态，如果远程控制已启用并且允许脚本运行，或者远程控制未启用，则启动脚本
@@ -62,8 +97,10 @@
                 const remoteStatus = app.config.getSetting('remoteControl.status.enabled', true);
                 
                 if (!remoteControlEnabled || remoteStatus) {
-                    app.core.messageDetector.start();
-                    app.utils.logger.info('已自动启动消息监听');
+                    // 延迟启动以确保其他组件完全就绪
+                    setTimeout(() => {
+                        startMessageDetection();
+                    }, 1000);
                 } else {
                     const message = app.config.getSetting('remoteControl.status.message', '脚本已被远程禁用');
                     app.utils.logger.info(`自动启动被远程控制阻止: ${message}`);
@@ -80,11 +117,44 @@
             app.followUpManager = new FollowUpManager(app);
             await app.followUpManager.init();
 
+            return true;
         } catch (error) {
             console.error('小红书私信自动回复助手: 初始化失败', error);
             if (app.utils && app.utils.logger) {
                 app.utils.logger.error('初始化失败', error);
             }
+            app.initializing = false;
+            return false;
+        }
+    }
+
+    /**
+     * 安全启动消息检测
+     */
+    function startMessageDetection() {
+        try {
+            // 双重检查确保所有依赖组件已初始化
+            if (!app.initialized) {
+                app.utils.logger.warn('应用尚未初始化完成，无法启动消息检测');
+                return false;
+            }
+
+            if (!app.core || !app.core.messageDetector) {
+                app.utils.logger.error('消息检测器未初始化，无法启动');
+                return false;
+            }
+
+            // 启动消息检测
+            const result = app.core.messageDetector.start();
+            if (result) {
+                app.utils.logger.info('消息检测成功启动');
+            } else {
+                app.utils.logger.error('消息检测启动失败');
+            }
+            return result;
+        } catch (error) {
+            app.utils.logger.error('启动消息检测时发生错误', error);
+            return false;
         }
     }
 
@@ -249,47 +319,20 @@
         try {
             console.log('小红书私信自动回复助手: UI加载中...');
 
-            // 1. 创建控制面板实例
-            // ControlPanel 类应该在构建时已包含
-            const panel = new ControlPanel(app);
-            await panel.initialize();
-
-            // 2. 创建设置面板实例
+            // 1. 创建设置面板
             // SettingsPanel 类应该在构建时已包含
-            const settings = new SettingsPanel(app);
-            await settings.initialize();
+            const settingsPanel = new SettingsPanel(app);
+            await settingsPanel.initialize();
 
-            // 3. 创建关键词规则管理模块实例
-            // KeywordRuleManager 类应该在构建时已包含
-            const keywordRuleManager = new KeywordRuleManager(app);
-            await keywordRuleManager.initialize();
-
-            // 在设置面板中添加关键词规则部分
-            if (settings.panel) {
-                const form = settings.panel.querySelector('.xhs-auto-reply-settings-form');
-                if (form) {
-                    keywordRuleManager.createRuleSection(form);
-                }
-            }
-
-            // 4. 在设置面板中添加获客工具设置
-            if (settings.panel && app.leadGeneration) { // 确保 app.leadGeneration 已初始化
-                const leadSection = settings.panel.querySelector('#xhs-auto-reply-settings-section-lead');
-                if (leadSection) {
-                    app.leadGeneration.createLeadGenerationSection(leadSection); // 调用实例方法
-                } else {
-                     app.utils.logger.warn('未找到获客工具设置区域的容器');
-                }
-            } else if (!app.leadGeneration) {
-                 app.utils.logger.warn('获客工具处理模块未初始化，无法创建设置区域');
-            }
-
+            // 2. 创建控制面板
+            // ControlPanel 类应该在构建时已包含
+            const controlPanel = new ControlPanel(app);
+            await controlPanel.initialize();
 
             // 设置UI对象
             app.ui = {
-                panel,
-                settings,
-                keywordRuleManager
+                settingsPanel,
+                controlPanel
             };
 
             app.utils.logger.info('UI加载完成');
@@ -300,11 +343,12 @@
         }
     }
 
-    // 检查是否在小红书私信页面
+    // 检查是否在私信页面
     function isInMessagePage() {
-        return window.location.href.includes('xiaohongshu.com') &&
-               (window.location.href.includes('/messages') ||
-                window.location.href.includes('/im'));
+        return (
+            window.location.href.includes('xiaohongshu.com/im') || 
+            window.location.href.includes('xiaohongshu.com/message')
+        );
     }
 
     // 等待页面加载完成
@@ -320,17 +364,53 @@
 
     // 主函数
     async function main() {
-        await waitForPageLoad();
+        try {
+            await waitForPageLoad();
 
-        if (isInMessagePage()) {
-            console.log('小红书私信自动回复助手: 检测到私信页面，开始初始化...');
-            await initialize();
-        } else {
-            console.log('小红书私信自动回复助手: 非私信页面，跳过初始化');
+            // 如果不在私信页面，则不初始化
+            if (!isInMessagePage()) {
+                console.log('小红书私信自动回复助手: 当前不在私信页面，不进行初始化');
+                return;
+            }
+
+            // 延迟初始化，确保页面完全加载
+            setTimeout(async () => {
+                // 尝试初始化
+                const success = await initialize();
+                if (!success) {
+                    console.error('小红书私信自动回复助手: 初始化失败，请刷新页面重试');
+                    
+                    // 添加重试机制
+                    if (app.startupErrors && app.startupErrors.length > 0) {
+                        console.error('初始化错误列表:', app.startupErrors);
+                    }
+                    
+                    // 尝试再次初始化，最多3次
+                    let retryCount = 0;
+                    const maxRetries = 3;
+                    const retryInterval = 5000; // 5秒
+                    
+                    const retryInitialize = async () => {
+                        if (retryCount >= maxRetries || app.initialized) return;
+                        
+                        retryCount++;
+                        console.log(`小红书私信自动回复助手: 尝试重新初始化 (${retryCount}/${maxRetries})...`);
+                        
+                        const retrySuccess = await initialize();
+                        if (!retrySuccess && retryCount < maxRetries) {
+                            setTimeout(retryInitialize, retryInterval);
+                        }
+                    };
+                    
+                    setTimeout(retryInitialize, retryInterval);
+                }
+            }, 2000); // 延迟2秒初始化
+        } catch (error) {
+            console.error('小红书私信自动回复助手: 主函数执行失败', error);
         }
     }
 
-    // 启动脚本
+    // 启动
     main();
 
 })();

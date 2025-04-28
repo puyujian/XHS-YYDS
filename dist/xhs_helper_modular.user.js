@@ -7552,6 +7552,9 @@ class AutoReply {
         this.app = app;
         this.replyQueue = []; // 回复队列
         this.processing = false; // 是否正在处理回复
+        this.sendRetries = {}; // 发送重试计数器
+        this.maxSendRetries = 3; // 最大发送重试次数
+        this.sendRetryDelay = 1000; // 重试延迟时间（毫秒）
     }
 
     /**
@@ -7578,7 +7581,11 @@ class AutoReply {
         return new Promise((resolve, reject) => {
             this.app.utils.logger.debug(`将回复添加到队列: ${content}`);
 
+            // 创建唯一的消息ID
+            const messageId = `reply_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
             this.replyQueue.push({
+                id: messageId,
                 contactId,
                 content,
                 resolve,
@@ -7617,7 +7624,7 @@ class AutoReply {
             let error = null;
             
             try {
-                success = await this.executeReply(reply.contactId, reply.content);
+                success = await this.executeReply(reply.contactId, reply.content, reply.id);
             } catch (replyError) {
                 // 捕获并记录executeReply中的错误，但不中断处理流程
                 error = replyError;
@@ -7641,8 +7648,6 @@ class AutoReply {
                 let errorMessage = '发送回复失败';
                 if (error) {
                     errorMessage += `: ${error.message || '未知内部错误'}`;
-                    // 尝试包含堆栈信息，如果日志库能处理或需要字符串形式
-                    // errorMessage += `\nStack: ${error.stack || 'N/A'}`; 
                 }
                     
                 const errorObj = new Error(errorMessage);
@@ -7652,7 +7657,6 @@ class AutoReply {
                 errorObj.contactId = reply.contactId;
                 errorObj.contentPreview = reply.content.substring(0, 50) + (reply.content.length > 50 ? '...' : '');
                 
-                // {{ Rationale: Pass the original error object 'error' as an additional argument to the logger for potentially more detailed logging, assuming the logger supports it. }}
                 this.app.utils.logger.error('回复处理失败', errorObj, error); // 传递原始错误给logger
                 
                 reply.reject(errorObj);
@@ -7693,16 +7697,27 @@ class AutoReply {
      * 执行回复操作
      * @param {string} contactId 联系人ID
      * @param {string} content 回复内容
+     * @param {string} messageId 消息唯一ID
      * @returns {Promise<boolean>} 是否成功
      */
-    async executeReply(contactId, content) {
+    async executeReply(contactId, content, messageId) {
+        // 获取当前重试次数
+        const retryCount = this.sendRetries[messageId] || 0;
+        
+        // 检查是否已达到最大重试次数
+        if (retryCount >= this.maxSendRetries) {
+            this.app.utils.logger.error(`消息 ${messageId} 已达到最大重试次数 ${this.maxSendRetries}，停止重试`);
+            delete this.sendRetries[messageId]; // 清理重试计数
+            return false;
+        }
+        
         let processPhase = '初始化';
         
         try {
             this.app.utils.logger.info(`正在回复: ${content.substring(0, 30)}${content.length > 30 ? '...' : ''}`);
             
             // 记录详细的消息参数
-            this.app.utils.logger.debug(`回复参数详情: 联系人ID=${contactId}, 内容长度=${content.length}`);
+            this.app.utils.logger.debug(`回复参数详情: 联系人ID=${contactId}, 内容长度=${content.length}, 重试次数=${retryCount}`);
 
             processPhase = '规范化联系人ID';
             // 规范化目标联系人ID
@@ -7743,310 +7758,196 @@ class AutoReply {
                         element.getAttribute('data-contactusemid'),
                         element.id,
                         element.getAttribute('data-uid'),
-                        element.getAttribute('id')
-                    ].filter(Boolean); // 过滤掉null和undefined
+                    ];
                     
-                    foundContactIds.push(...idAttributes);
+                    // 过滤掉null和undefined
+                    const validIds = idAttributes.filter(id => id);
                     
-                    // 尝试所有ID属性查找精确匹配
-                    for (const attr of idAttributes) {
-                        const normalizedAttr = this.app.core.messageDetector.normalizeContactId(attr);
-                        if (normalizedAttr === contactId) {
-                            this.app.utils.logger.debug(`找到完全匹配联系人元素: ${attr} => ${normalizedAttr}`);
-                            targetContactElement = element;
-                            break;
-                        }
+                    // 记录所有找到的ID
+                    if (validIds.length > 0) {
+                        foundContactIds.push(...validIds);
                     }
                     
-                    if (targetContactElement) break;
+                    // 检查任何一个ID是否匹配
+                    if (validIds.some(id => this.isContactIdMatch(id, contactId))) {
+                        targetContactElement = element;
+                        break;
+                    }
                 }
                 
-                // 第二步：如果没有找到精确匹配，尝试部分匹配
+                this.app.utils.logger.debug(`联系人查找结果，找到的所有ID: ${foundContactIds.join(', ')}`);
+
                 if (!targetContactElement) {
-                    this.app.utils.logger.debug(`未找到完全匹配联系人，尝试部分匹配...`);
-                    
-                    for (const element of contactElements) {
-                        const idAttributes = [
-                            element.getAttribute('data-key'),
-                            element.getAttribute('data-id'),
-                            element.getAttribute('data-contactusemid'),
-                            element.id,
-                            element.getAttribute('data-uid'),
-                            element.getAttribute('id')
-                        ].filter(Boolean);
-                        
-                        for (const attr of idAttributes) {
-                            const normalizedAttr = this.app.core.messageDetector.normalizeContactId(attr);
-                            
-                            // 检查部分包含关系
-                            if (normalizedAttr.includes(contactId) || contactId.includes(normalizedAttr)) {
-                                this.app.utils.logger.debug(`找到部分匹配联系人元素: ${attr} => ${normalizedAttr}`);
-                                targetContactElement = element;
-                                break;
-                            }
-                        }
-                        
-                        if (targetContactElement) break;
-                    }
-                }
-                
-                // 第三步：如果仍未找到，尝试通过联系人名称查找
-                if (!targetContactElement) {
-                    this.app.utils.logger.debug(`未找到ID匹配联系人，尝试通过名称或关联信息查找...`);
-                    
-                    // 可以通过会话历史获取联系人名称或其他信息进行匹配
-                    // 此处需要根据实际情况添加额外的联系人查找逻辑
-                }
-
-                // 调试信息：记录所有找到的联系人ID
-                this.app.utils.logger.debug(`所有找到的联系人ID: ${JSON.stringify(foundContactIds)}`);
-
-                // 如果找到了联系人元素，尝试切换
-                if (targetContactElement) {
-                    this.app.utils.logger.debug('找到目标联系人元素，尝试切换');
-
-                    // 模拟点击联系人 - 使用增强点击
-                    this.app.utils.logger.debug('使用增强点击方法切换联系人');
-                    try {
-                        // 首先尝试使用高级点击方法
-                        await this.app.utils.dom.enhancedClickWithVerification(targetContactElement, {
-                            verifyClick: true,
-                            maxAttempts: 3,
-                            clickDelayMs: 300
-                        });
-                    } catch (clickError) {
-                        // 如果高级点击失败，尝试标准点击
-                        this.app.utils.logger.warn('增强点击失败，尝试标准点击', clickError);
-                        this.app.utils.dom.simulateClick(targetContactElement);
-                    }
-
-                    // 强制更新当前联系人ID
-                    this.app.core.messageDetector.currentContactId = contactId;
-
-                    // 增加等待时间以确保UI完全更新
-                    this.app.utils.logger.debug('等待联系人切换完成...');
-                    const waitTime = 2000; // 增加到2秒
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                    
-                    // 额外检查是否切换成功
-                    const afterSwitchId = this.app.core.messageDetector.currentContactId;
-                    this.app.utils.logger.debug(`切换后的联系人ID: ${afterSwitchId}`);
-                    
-                    // 保险措施：再次点击确保激活
-                    if (!this.isContactIdMatch(afterSwitchId, contactId)) {
-                        this.app.utils.logger.warn('联系人可能未正确切换，尝试再次点击');
-                        this.app.utils.dom.simulateClick(targetContactElement);
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                    }
-
-                    this.app.utils.logger.debug('联系人切换流程完成');
-                } else {
-                    this.app.utils.logger.warn('未找到目标联系人元素，无法切换');
-                }
-            }
-
-            processPhase = '联系人ID验证';
-            // 重新检查当前联系人是否是目标联系人 - 增强版
-            let updatedCurrentId = this.app.core.messageDetector.currentContactId;
-            updatedCurrentId = this.app.core.messageDetector.normalizeContactId(updatedCurrentId);
-            
-            // 增强的ID匹配逻辑
-            const isTargetContact = this.isContactIdMatch(updatedCurrentId, contactId);
-
-            this.app.utils.logger.debug(`增强ID比较:
-                当前ID=${updatedCurrentId}
-                目标ID=${contactId}
-                匹配结果=${isTargetContact}`);
-
-            if (!isTargetContact) {
-                // 最后尝试：检查界面上是否存在包含目标ID的元素
-                const pageElements = document.querySelectorAll('*[data-id], *[data-key], *[id]');
-                let foundMatchInPage = false;
-                
-                for (const element of pageElements) {
-                    const elementIds = [
-                        element.getAttribute('data-id'),
-                        element.getAttribute('data-key'),
-                        element.id
-                    ].filter(Boolean);
-                    
-                    for (const id of elementIds) {
-                        const normalizedId = this.app.core.messageDetector.normalizeContactId(id);
-                        if (this.isContactIdMatch(normalizedId, contactId)) {
-                            foundMatchInPage = true;
-                            this.app.utils.logger.debug(`在页面元素中找到匹配的ID: ${id}`);
-                            break;
-                        }
-                    }
-                    
-                    if (foundMatchInPage) break;
-                }
-                
-                if (foundMatchInPage) {
-                    this.app.utils.logger.info(`虽然当前联系人ID不匹配，但在页面上找到了相关元素，尝试继续发送回复`);
-                } else {
-                    this.app.utils.logger.warn(`当前联系人(${updatedCurrentId})不是目标联系人(${contactId})，无法发送回复`);
+                    this.app.utils.logger.error(`无法找到目标联系人（ID: ${contactId}）`);
+                    this.handleSendError(messageId, '找不到联系人元素');
                     return false;
                 }
-            }
 
-            processPhase = '获取输入框';
-            // 1. 获取输入框元素
-            this.app.utils.logger.debug('尝试获取输入框元素');
-            const textArea = await this.app.utils.dom.waitForElement(
-                this.app.utils.dom.selectors.textArea,
-                5000
-            ).catch(error => {
-                this.handleReplyError(error, processPhase, { selector: this.app.utils.dom.selectors.textArea });
-                return null;
-            });
-
-            if (!textArea) {
-                this.app.utils.logger.error('未找到输入框元素');
-                return false;
-            }
-
-            this.app.utils.logger.debug('成功找到输入框元素');
-
-            processPhase = '获取发送按钮';
-            // 2. 获取发送按钮
-            this.app.utils.logger.debug('尝试获取发送按钮');
-            const sendButton = await this.app.utils.dom.waitForElement(
-                this.app.utils.dom.selectors.sendButton,
-                5000
-            ).catch(error => {
-                this.handleReplyError(error, processPhase, { selector: this.app.utils.dom.selectors.sendButton });
-                return null;
-            });
-
-            if (!sendButton) {
-                this.app.utils.logger.error('未找到发送按钮');
-                return false;
-            }
-
-            this.app.utils.logger.debug('成功找到发送按钮');
-
-            processPhase = '输入内容';
-            // 3. 在输入框中输入内容
-            this.app.utils.logger.debug('设置输入框内容');
-            try {
-                this.app.utils.dom.setValue(textArea, content);
-            } catch (inputError) {
-                this.handleReplyError(inputError, processPhase, { contentLength: content.length });
-                return false;
-            }
-
-            // 等待一小段时间确保输入完成
-            await new Promise(resolve => setTimeout(resolve, 500)); // 增加到500ms
-
-            processPhase = '检查发送按钮状态';
-            // 4. 检查发送按钮是否可用
-            const isDisabled = sendButton.classList.contains('disabled') ||
-                             sendButton.disabled ||
-                             sendButton.getAttribute('aria-disabled') === 'true';
-
-            if (isDisabled) {
-                this.app.utils.logger.warn('发送按钮不可用，尝试检查其他原因');
+                // 尝试点击目标联系人
+                this.app.utils.logger.debug('尝试点击目标联系人');
                 
-                // 记录按钮状态详情
-                this.app.utils.logger.debug(`按钮状态详情: 
-                    类名: ${sendButton.className}
-                    disabled属性: ${sendButton.disabled}
-                    aria-disabled属性: ${sendButton.getAttribute('aria-disabled')}
-                `);
-
-                // 尝试激活按钮
-                const isContentEmpty = textArea.value.trim() === '';
-                if (isContentEmpty) {
-                    this.app.utils.logger.warn('输入框内容为空，重新设置内容');
-                    this.app.utils.dom.setValue(textArea, content);
-                    await new Promise(resolve => setTimeout(resolve, 300));
-                }
-
-                // 如果按钮还是不可用，尝试模拟Enter键
-                if (sendButton.classList.contains('disabled') || sendButton.disabled) {
-                    this.app.utils.logger.warn('发送按钮仍不可用，尝试使用Enter键发送');
-                    this.app.utils.dom.simulateKeypress(textArea, 'Enter');
-
-                    // 等待一小段时间确保发送完成
-                    await new Promise(resolve => setTimeout(resolve, 500));
-
-                    // 检查输入框是否已清空（发送成功的标志）
-                    const afterEnterValue = this.app.utils.dom.getValue(textArea);
-                    if (afterEnterValue === '') {
-                        this.app.utils.logger.info('通过Enter键成功发送回复');
-                        return true;
-                    } else {
-                        this.app.utils.logger.warn('通过Enter键发送可能失败，输入框未清空');
-                    }
-
-                    return false;
-                }
-            }
-
-            processPhase = '点击发送按钮';
-            // 5. 点击发送按钮
-            this.app.utils.logger.debug('点击发送按钮');
-            try {
-                this.app.utils.dom.simulateClick(sendButton);
-            } catch (clickError) {
-                this.handleReplyError(clickError, processPhase, { 
-                    buttonClass: sendButton.className,
-                    buttonDisabled: sendButton.disabled
-                });
-                
-                // 尝试使用更高级的点击方法
                 try {
-                    this.app.utils.logger.debug('尝试使用增强点击方法');
-                    await this.app.utils.dom.enhancedClickWithVerification(sendButton, {
-                        verifyClick: true,
-                        maxAttempts: 2
-                    });
-                } catch (advancedClickError) {
-                    this.handleReplyError(advancedClickError, '增强点击发送按钮', {
-                        buttonClass: sendButton.className
-                    });
+                    // 使用增强的点击方法
+                    const clickSuccess = await this.app.utils.dom.enhancedClickWithVerification(
+                        targetContactElement,
+                        {
+                            // 验证函数：检查联系人是否变为活跃状态
+                            verificationFn: () => {
+                                return targetContactElement.classList.contains('active');
+                            },
+                            verificationTimeout: 3000,
+                            maxRetries: 3
+                        }
+                    );
+                    
+                    if (!clickSuccess) {
+                        this.app.utils.logger.warn('点击联系人失败，尝试备用方案');
+                        // 尝试简单点击
+                        this.app.utils.dom.simulateClick(targetContactElement);
+                    }
+                } catch (clickError) {
+                    this.app.utils.logger.error('点击联系人出错', clickError);
+                    this.app.utils.dom.simulateClick(targetContactElement);
+                }
+                
+                // 等待切换完成
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+                // 重新获取当前联系人ID
+                const newCurrentId = this.app.core.messageDetector.currentContactId;
+                this.app.utils.logger.debug(`切换后的当前联系人ID: ${newCurrentId}`);
+                
+                // 验证切换是否成功
+                if (!this.isContactIdMatch(newCurrentId, contactId)) {
+                    this.app.utils.logger.error('切换联系人失败，当前联系人ID与目标不匹配');
+                    this.handleSendError(messageId, '切换联系人失败');
                     return false;
                 }
+                
+                this.app.utils.logger.info('成功切换到目标联系人');
             }
 
-            // 等待一小段时间确保发送完成
-            await new Promise(resolve => setTimeout(resolve, 800)); // 增加到800ms
-
-            processPhase = '验证发送结果';
-            // 检查输入框是否已清空（发送成功的标志）
-            const afterSendValue = this.app.utils.dom.getValue(textArea);
-
-            if (afterSendValue === '') {
-                this.app.utils.logger.info('回复已成功发送');
-                return true;
-            } else {
-                this.app.utils.logger.warn('回复可能未成功发送，输入框未清空', {
-                    inputValueAfterSend: afterSendValue,
-                    inputValueLength: afterSendValue.length
-                });
-
-                // 如果点击按钮失败，尝试再次点击
-                this.app.utils.logger.debug('尝试再次点击发送按钮');
+            // 执行发送
+            processPhase = '发送消息';
+            this.app.utils.logger.debug('准备发送消息内容...');
+            
+            // 获取输入框
+            const textArea = this.app.utils.dom.getElement(this.app.utils.dom.selectors.textArea);
+            if (!textArea) {
+                this.app.utils.logger.error('找不到消息输入框');
+                this.handleSendError(messageId, '找不到消息输入框');
+                return false;
+            }
+            
+            // 清空输入框
+            textArea.value = '';
+            this.app.utils.dom.setValue(textArea, '');
+            
+            // 模拟点击输入框，确保激活
+            this.app.utils.dom.simulateClick(textArea);
+            
+            // 等待输入框激活
+            await new Promise(resolve => setTimeout(resolve, 200));
+            
+            // 输入内容
+            this.app.utils.dom.setValue(textArea, content);
+            
+            // 分发输入事件
+            const inputEvent = new Event('input', { bubbles: true });
+            textArea.dispatchEvent(inputEvent);
+            
+            // 等待消息内容加载
+            await new Promise(resolve => setTimeout(resolve, 300));
+            
+            // 检查发送按钮是否可点击
+            const sendButton = this.app.utils.dom.getElement(this.app.utils.dom.selectors.sendButton);
+            if (!sendButton) {
+                this.app.utils.logger.error('找不到发送按钮');
+                this.handleSendError(messageId, '找不到发送按钮');
+                return false;
+            }
+            
+            // 点击发送按钮
+            this.app.utils.logger.debug('点击发送按钮');
+            
+            // 使用增强的点击方法
+            try {
+                await this.app.utils.dom.enhancedClickWithVerification(
+                    sendButton,
+                    {
+                        // 验证函数：检查输入框是否已清空
+                        verificationFn: () => {
+                            return !textArea.value || textArea.value.trim() === '';
+                        },
+                        verificationTimeout: 2000,
+                        maxRetries: 2
+                    }
+                );
+            } catch (sendError) {
+                this.app.utils.logger.warn('增强点击发送失败，尝试备用方法', sendError);
                 this.app.utils.dom.simulateClick(sendButton);
-
+                
+                // 等待一小段时间，让发送操作完成
                 await new Promise(resolve => setTimeout(resolve, 500));
-
-                const afterSecondClick = this.app.utils.dom.getValue(textArea);
-                if (afterSecondClick === '') {
-                    this.app.utils.logger.info('第二次尝试发送成功');
-                    return true;
-                } else {
-                    this.app.utils.logger.warn('两次尝试发送均失败');
-                    return false;
-                }
             }
+            
+            // 验证发送成功 - 检查输入框是否已清空
+            if (textArea.value && textArea.value.trim() !== '') {
+                this.app.utils.logger.warn('发送后输入框未清空，可能发送失败');
+                this.handleSendError(messageId, '发送后输入框未清空');
+                return false;
+            }
+            
+            // 清理重试计数
+            delete this.sendRetries[messageId];
+            
+            this.app.utils.logger.info('消息发送成功');
+            return true;
         } catch (error) {
-            this.handleReplyError(error, processPhase, { 
-                contactId,
-                contentPreview: content.substring(0, 30) + (content.length > 30 ? '...' : '')
-            });
+            this.handleSendError(messageId, processPhase, { error });
             return false;
+        }
+    }
+
+    /**
+     * 处理发送错误
+     * @param {string} messageId 消息ID
+     * @param {string} phase 失败阶段
+     * @param {object} details 额外详情
+     */
+    handleSendError(messageId, phase, details = {}) {
+        // 增加重试计数
+        this.sendRetries[messageId] = (this.sendRetries[messageId] || 0) + 1;
+        const currentRetry = this.sendRetries[messageId];
+        
+        // 记录错误详情
+        this.app.utils.logger.error(`发送消息失败，阶段: ${phase}，重试次数: ${currentRetry}/${this.maxSendRetries}`, details);
+        
+        // 如果未达到最大重试次数，将消息重新加入队列
+        if (currentRetry < this.maxSendRetries) {
+            this.app.utils.logger.info(`将在 ${this.sendRetryDelay}ms 后重试发送消息`);
+            
+            // 延迟一段时间后重新加入队列
+            setTimeout(() => {
+                // 将当前处理的消息重新加入队列最前面
+                if (this.replyQueue[0] && this.replyQueue[0].id === messageId) {
+                    // 已经在队列中，不需要再添加
+                    this.app.utils.logger.debug(`消息 ${messageId} 已在队列中，不再重新添加`);
+                } else {
+                    for (let i = 0; i < this.replyQueue.length; i++) {
+                        if (this.replyQueue[i].id === messageId) {
+                            // 已经在队列中，移到队首
+                            const msg = this.replyQueue.splice(i, 1)[0];
+                            this.replyQueue.unshift(msg);
+                            this.app.utils.logger.debug(`消息 ${messageId} 已移到队首`);
+                            return;
+                        }
+                    }
+                }
+            }, this.sendRetryDelay);
+        } else {
+            this.app.utils.logger.error(`消息 ${messageId} 已达到最大重试次数 ${this.maxSendRetries}，不再重试`);
+            delete this.sendRetries[messageId]; // 清理重试计数
         }
     }
 
@@ -8054,19 +7955,24 @@ class AutoReply {
      * 清空回复队列
      */
     clearReplyQueue() {
-        const count = this.replyQueue.length;
-
-        // 拒绝所有等待中的回复
-        for (const reply of this.replyQueue) {
-            reply.reject(new Error('回复队列已清空'));
+        const queueLength = this.replyQueue.length;
+        
+        if (queueLength > 0) {
+            this.app.utils.logger.info(`清空回复队列，共有 ${queueLength} 条未处理的回复`);
+            
+            // 拒绝所有待处理的回复
+            for (const reply of this.replyQueue) {
+                if (typeof reply.reject === 'function') {
+                    reply.reject(new Error('回复队列已被清空'));
+                }
+            }
+            
+            this.replyQueue = [];
         }
-
-        this.replyQueue = [];
-        this.app.utils.logger.info(`已清空回复队列，共${count}条回复`);
     }
 
     /**
-     * 增强的联系人ID匹配逻辑
+     * 检查两个联系人ID是否匹配
      * @param {string} id1 第一个ID
      * @param {string} id2 第二个ID
      * @returns {boolean} 是否匹配
@@ -8074,79 +7980,14 @@ class AutoReply {
     isContactIdMatch(id1, id2) {
         if (!id1 || !id2) return false;
         
-        // 规范化处理
-        id1 = String(id1).trim();
-        id2 = String(id2).trim();
-        
-        // 完全匹配
+        // 直接比较是否完全相同
         if (id1 === id2) return true;
         
-        // 包含关系匹配
-        if (id1.includes(id2) || id2.includes(id1)) return true;
+        // 规范化后比较
+        const normalized1 = this.app.core.messageDetector.normalizeContactId(id1);
+        const normalized2 = this.app.core.messageDetector.normalizeContactId(id2);
         
-        // 提取数字部分进行匹配（小红书ID通常有一定规律）
-        const numbers1 = id1.replace(/[^0-9]/g, '');
-        const numbers2 = id2.replace(/[^0-9]/g, '');
-        
-        if (numbers1 && numbers2) {
-            // 数字部分完全匹配
-            if (numbers1 === numbers2) return true;
-            
-            // 数字部分包含关系（至少8位数字）
-            if (numbers1.length >= 8 && numbers2.length >= 8) {
-                if (numbers1.includes(numbers2) || numbers2.includes(numbers1)) return true;
-            }
-        }
-        
-        return false;
-    }
-
-    /**
-     * 处理回复操作过程中出现的错误
-     * @param {Error} error 错误对象
-     * @param {string} phase 处理阶段
-     * @param {Object} details 附加信息
-     */
-    handleReplyError(error, phase, details = {}) {
-        // 构建增强的错误信息
-        const enhancedError = {
-            originalError: error,
-            message: error.message || '未知错误',
-            phase: phase,
-            stack: error.stack,
-            details: details
-        };
-        
-        // 确定错误级别和详细程度
-        let errorLevel = 'error';
-        
-        // 某些特定错误可以降级为警告
-        const warningPatterns = [
-            '未找到元素',
-            '超时',
-            '联系人不匹配'
-        ];
-        
-        if (warningPatterns.some(pattern => enhancedError.message.includes(pattern))) {
-            errorLevel = 'warn';
-        }
-        
-        // 记录错误
-        this.app.utils.logger[errorLevel](`回复过程中出错 [${phase}]: ${enhancedError.message}`, enhancedError);
-        
-        // 根据错误阶段和类型，尝试建议修复措施
-        let suggestion = '';
-        if (phase === '联系人切换') {
-            suggestion = '请检查联系人ID格式是否正确，并确认联系人是否存在于列表中';
-        } else if (phase === '输入内容') {
-            suggestion = '请检查输入框是否可交互，内容是否合规';
-        } else if (phase === '点击发送') {
-            suggestion = '请检查发送按钮是否可用，可能需要点击输入框激活它';
-        }
-        
-        if (suggestion) {
-            this.app.utils.logger.debug(`错误修复建议: ${suggestion}`);
-        }
+        return normalized1 === normalized2;
     }
 }
 
@@ -8158,6 +7999,10 @@ class AutoReply {
         constructor(app) {
             this.app = app;
             this.processingMessage = false; // 是否正在处理消息
+            this.messageRetryQueue = []; // 添加一个重试队列，用于存储处理失败的消息
+            this.maxRetries = 3; // 最大重试次数
+            this.retryInterval = 2000; // 重试间隔（毫秒）
+            this.retryTimeoutId = null; // 重试的定时器ID
         }
 
         /**
@@ -8178,6 +8023,9 @@ class AutoReply {
                     this.app.utils.logger.warn('获客工具处理器未初始化，获客工具相关功能将不可用');
                 }
 
+                // 启动重试机制
+                this.startRetryTimer();
+
                 return true;
             } catch (error) {
                 this.app.utils.logger.error('初始化消息处理模块失败', error);
@@ -8193,19 +8041,21 @@ class AutoReply {
             // 防止并发处理消息
             if (this.processingMessage) {
                 this.app.utils.logger.debug('正在处理其他消息，稍后处理此消息');
+                // 添加到重试队列，确保后续处理
+                this.addToRetryQueue({message, retryCount: 0});
                 return;
             }
 
             try {
                 this.processingMessage = true;
 
-                // --- FIX: Add check for config initialization ---
+                // 检查配置初始化是否完成
                 if (!this.app.config || !this.app.config.initialized) {
-                    this.app.utils.logger.warn('Config not initialized yet, skipping message processing.');
-                    this.processingMessage = false; // Release lock
+                    this.app.utils.logger.warn('配置初始化尚未完成，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
                     return;
                 }
-                // --- END FIX ---
 
                 // 记录消息类型
                 if (message.isSystemMessage) {
@@ -8218,11 +8068,35 @@ class AutoReply {
                 }
 
                 // 验证必要的工具和数据
-                if (!this.app.utils.sessionManager) throw new Error('会话管理器未初始化');
-                if (!this.app.core.aiService) throw new Error('AI 服务未初始化');
-                if (!this.app.core.leadGenerationHandler) throw new Error('获客工具处理器未初始化');
-                if (!this.app.core.autoReply) throw new Error('自动回复模块未初始化');
-                if (!message || !message.contactId || message.content === undefined) throw new Error('消息数据不完整');
+                if (!this.app.utils.sessionManager) {
+                    this.app.utils.logger.error('会话管理器未初始化，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
+                if (!this.app.core.aiService) {
+                    this.app.utils.logger.error('AI 服务未初始化，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
+                if (!this.app.core.leadGenerationHandler) {
+                    this.app.utils.logger.error('获客工具处理器未初始化，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
+                if (!this.app.core.autoReply) {
+                    this.app.utils.logger.error('自动回复模块未初始化，将消息添加到重试队列');
+                    this.addToRetryQueue({message, retryCount: 0});
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
+                if (!message || !message.contactId || message.content === undefined) {
+                    this.app.utils.logger.error('消息数据不完整，跳过处理');
+                    this.processingMessage = false; // 释放锁
+                    return;
+                }
 
                 // [新增] 检查联系人是否有客资标签且启用了忽略功能
                 const ignoreLeadTags = this.app.config.getSetting('reply.ignoreLeadTags', false);
@@ -8233,7 +8107,7 @@ class AutoReply {
                     
                     if (contactElement) {
                         // 检查客资标签
-                        const { hasLeadTag, leadTagText } = this.app.utils.messageDetector.checkContactLeadTag(contactElement);
+                        const { hasLeadTag, leadTagText } = this.app.core.messageDetector.checkContactLeadTag(contactElement);
                         
                         if (hasLeadTag) {
                             this.app.utils.logger.info(`跳过处理带有客资标签(${leadTagText})的联系人消息: ${message.contactId}`);
@@ -8496,9 +8370,95 @@ class AutoReply {
 
             } catch (error) {
                 this.app.utils.logger.error('处理消息失败', error);
+                // 添加到重试队列
+                this.addToRetryQueue({message, retryCount: 0});
             } finally {
                 this.processingMessage = false;
             }
+        }
+
+        /**
+         * 添加消息到重试队列
+         * @param {Object} retryData 包含消息和重试次数的对象
+         */
+        addToRetryQueue(retryData) {
+            // 检查是否已经在队列中
+            const existingIndex = this.messageRetryQueue.findIndex(item => 
+                item.message.id === retryData.message.id);
+            
+            if (existingIndex >= 0) {
+                // 更新已存在的条目
+                this.messageRetryQueue[existingIndex].retryCount = Math.max(
+                    this.messageRetryQueue[existingIndex].retryCount,
+                    retryData.retryCount
+                );
+                this.app.utils.logger.debug(`更新重试队列中的消息，ID: ${retryData.message.id}，重试次数: ${this.messageRetryQueue[existingIndex].retryCount}`);
+            } else {
+                // 添加新条目
+                this.messageRetryQueue.push(retryData);
+                this.app.utils.logger.debug(`将消息添加到重试队列，ID: ${retryData.message.id}，重试次数: ${retryData.retryCount}`);
+            }
+        }
+
+        /**
+         * 启动重试计时器
+         */
+        startRetryTimer() {
+            if (this.retryTimeoutId) {
+                clearTimeout(this.retryTimeoutId);
+            }
+
+            this.retryTimeoutId = setTimeout(() => {
+                this.processRetryQueue();
+            }, this.retryInterval);
+        }
+
+        /**
+         * 处理重试队列中的消息
+         */
+        async processRetryQueue() {
+            if (this.messageRetryQueue.length === 0) {
+                // 队列为空，继续等待
+                this.startRetryTimer();
+                return;
+            }
+
+            if (this.processingMessage) {
+                // 当前正在处理消息，稍后再试
+                this.app.utils.logger.debug('当前正在处理消息，延迟处理重试队列');
+                this.startRetryTimer();
+                return;
+            }
+
+            // 取出第一个待重试的消息
+            const retryData = this.messageRetryQueue.shift();
+            
+            // 检查重试次数
+            if (retryData.retryCount >= this.maxRetries) {
+                this.app.utils.logger.warn(`消息 ${retryData.message.id} 已达到最大重试次数 ${this.maxRetries}，放弃处理`);
+                // 继续处理下一个消息
+                this.startRetryTimer();
+                return;
+            }
+
+            // 更新重试次数
+            retryData.retryCount++;
+            
+            this.app.utils.logger.info(`尝试重新处理消息，ID: ${retryData.message.id}，重试次数: ${retryData.retryCount}/${this.maxRetries}`);
+            
+            // 尝试处理消息
+            try {
+                await this.handleMessage(retryData.message);
+            } catch (error) {
+                this.app.utils.logger.error(`重试处理消息失败，ID: ${retryData.message.id}`, error);
+                // 如果还没达到最大重试次数，重新加入队列
+                if (retryData.retryCount < this.maxRetries) {
+                    this.addToRetryQueue(retryData);
+                }
+            }
+
+            // 继续处理队列中的下一个消息
+            this.startRetryTimer();
         }
 
         /**
@@ -8767,6 +8727,11 @@ class MessageDetector {
             processedMessages: new Set(),
             lastCheckTime: 0
         };
+        // 添加消息处理失败计数器
+        this.failedMessagesCount = 0;
+        this.maxConsecutiveFailures = 5; // 允许的最大连续失败次数
+        this.recoveryAttempts = 0; // 恢复尝试次数
+        this.maxRecoveryAttempts = 3; // 最大恢复尝试次数
     }
 
     /**
@@ -8786,6 +8751,10 @@ class MessageDetector {
                 clearTimeout(this.switchContactTimeout);
                 this.switchContactTimeout = null;
             }
+
+            // 重置失败计数器
+            this.failedMessagesCount = 0;
+            this.recoveryAttempts = 0;
 
             // 等待页面加载完成
             await this.waitForPageElements();
@@ -8853,6 +8822,10 @@ class MessageDetector {
             // 清除之前的处理状态
             this.lastProcessedMessages.clear();
             this.app.utils.logger.debug('清除先前处理的消息缓存');
+
+            // 重置失败计数器
+            this.failedMessagesCount = 0;
+            this.recoveryAttempts = 0;
 
             // 开始监听联系人变化
             this.startContactListObserver();
@@ -9121,38 +9094,25 @@ class MessageDetector {
      * 启动消息观察器
      */
     startMessageObserver() {
-        this.app.utils.logger.debug('启动消息观察');
+        // 检查备份方法是否存在
+        if (!this.app.utils.dom.observeMessageList) {
+            this.app.utils.logger.error('消息观察器方法不存在，将使用备用检查机制');
+            return;
+        }
 
-        // 监听消息列表变化
-        this.observer = this.app.utils.dom.observeMessageList((newMessages, removedMessages) => {
-            // 添加更详细的日志
-            if (newMessages.length > 0) {
-                this.app.utils.logger.debug(`消息观察器检测到 ${newMessages.length} 条新消息`);
+        try {
+            // 开始观察消息列表
+            this.observer = this.app.utils.dom.observeMessageList((newMessages, removedMessages) => {
+                this.handleMessageListChange(newMessages, removedMessages);
+            });
 
-                // 记录消息类型信息
-                const msgTypes = new Set();
-                newMessages.forEach(msg => {
-                    const leftMsg = msg.querySelector(this.app.utils.dom.selectors.leftMessage);
-                    if (leftMsg) {
-                        const type = leftMsg.getAttribute('data-msg-type') || 'UNKNOWN';
-                        msgTypes.add(type);
-                    }
-                });
-
-                const typesStr = Array.from(msgTypes).join(', ');
-                if (typesStr) {
-                    this.app.utils.logger.debug(`消息类型：${typesStr}`);
-                }
+            if (!this.observer) {
+                this.app.utils.logger.warn('消息观察器创建失败，将依赖备用检查机制');
+            } else {
+                this.app.utils.logger.debug('消息观察器已启动');
             }
-
-            this.handleMessageListChange(newMessages, removedMessages);
-        });
-
-        // 检查是否成功设置观察器
-        if (this.observer) {
-            this.app.utils.logger.debug('消息观察器设置成功');
-        } else {
-            this.app.utils.logger.warn('消息观察器设置失败');
+        } catch (error) {
+            this.app.utils.logger.error('启动消息观察器失败，将使用备用检查机制', error);
         }
     }
 
@@ -9199,7 +9159,9 @@ class MessageDetector {
                 const leadTagText = hasLeadTag ? this.app.utils.dom.getText(tagElement) : '';
 
                 // 检查是否启用了忽略客资标签设置
-                const ignoreLeadTags = this.app.config.getSetting('reply.ignoreLeadTags', false);
+                const ignoreLeadTags = this.app.config && this.app.config.getSetting
+                    ? this.app.config.getSetting('reply.ignoreLeadTags', false)
+                    : false;
 
                 // 如果有客资标签且开启了忽略客资标签设置，则跳过该消息
                 if (hasLeadTag && ignoreLeadTags) {
@@ -9276,20 +9238,29 @@ class MessageDetector {
 
             this.app.utils.logger.debug(`处理消息类型: ${msgTypeAttr || 'UNKNOWN'}`);
 
-            if (msgTypeAttr === 'CARD') {
-                // 处理笔记卡片类型
+            if (msgType === 'CARD') {
+                // 处理卡片消息
                 messageType = 'CARD';
                 const cardContainer = leftMessageElement.querySelector(this.app.utils.dom.selectors.messageCardContainer);
-                if (cardContainer) {
-                    const titleElement = cardContainer.querySelector(this.app.utils.dom.selectors.messageCardTitle);
-                    messageTitle = titleElement ? titleElement.textContent.trim() : '未知笔记';
-                    messageText = `[笔记卡片] ${messageTitle}`;
-
-                    this.app.utils.logger.debug(`检测到笔记卡片: ${messageTitle}`);
-                } else {
-                    this.app.utils.logger.debug('未找到卡片容器元素');
+                if (!cardContainer) {
+                    this.app.utils.logger.debug('未找到卡片容器，无法处理');
                     return;
                 }
+
+                // 获取卡片标题
+                const titleElement = cardContainer.querySelector(this.app.utils.dom.selectors.messageCardTitle);
+                messageTitle = titleElement ? titleElement.textContent.trim() : '';
+
+                // 获取卡片信息
+                const infoElement = cardContainer.querySelector(this.app.utils.dom.selectors.messageCardInfo);
+                messageText = infoElement ? infoElement.textContent.trim() : messageTitle;
+
+                if (!messageText && !messageTitle) {
+                    this.app.utils.logger.debug('卡片内容为空，无法处理');
+                    return;
+                }
+
+                this.app.utils.logger.debug(`检测到卡片消息，标题: ${messageTitle}, 内容: ${messageText}`);
             } else if (messageElement.querySelector('.source-tip')) {
                 // 处理聚光进线消息
                 messageType = 'SPOTLIGHT';
@@ -9383,12 +9354,35 @@ class MessageDetector {
 
             // 处理消息
             try {
+                // 检查核心组件是否已初始化
+                if (!this.app.core || !this.app.core.messageHandler) {
+                    this.app.utils.logger.warn('消息处理器未初始化，跳过消息处理');
+                    this.failedMessagesCount++;
+                    if (this.failedMessagesCount >= this.maxConsecutiveFailures) {
+                        this.attemptRecovery();
+                    }
+                    return;
+                }
+
                 await this.app.core.messageHandler.handleMessage(message);
+                
+                // 成功处理消息，重置失败计数器
+                this.failedMessagesCount = 0;
             } catch (error) {
                 this.app.utils.logger.error('处理消息失败', error);
+                this.failedMessagesCount++;
+                
+                if (this.failedMessagesCount >= this.maxConsecutiveFailures) {
+                    this.attemptRecovery();
+                }
             }
         } catch (error) {
             this.app.utils.logger.error('处理新消息失败', error);
+            this.failedMessagesCount++;
+            
+            if (this.failedMessagesCount >= this.maxConsecutiveFailures) {
+                this.attemptRecovery();
+            }
         }
     }
 
@@ -9591,6 +9585,45 @@ class MessageDetector {
         
         // 确保返回的ID不为空
         return contactId || '未知ID';
+    }
+
+    /**
+     * 尝试恢复消息检测系统
+     */
+    async attemptRecovery() {
+        if (this.recoveryAttempts >= this.maxRecoveryAttempts) {
+            this.app.utils.logger.error(`已达到最大恢复尝试次数(${this.maxRecoveryAttempts})，放弃恢复`);
+            return;
+        }
+        
+        this.recoveryAttempts++;
+        this.app.utils.logger.warn(`检测到连续失败(${this.failedMessagesCount}次)，正在尝试恢复消息检测系统 (尝试 ${this.recoveryAttempts}/${this.maxRecoveryAttempts})`);
+        
+        try {
+            // 停止当前的观察器
+            if (this.observer) {
+                this.observer.disconnect();
+                this.observer = null;
+            }
+            
+            // 重置处理状态
+            this.lastProcessedMessages.clear();
+            this.failedMessagesCount = 0;
+            
+            // 重新启动消息观察器
+            this.startMessageObserver();
+            this.app.utils.logger.info('消息观察器已重新启动');
+            
+            // 清空并释放资源
+            this.pendingMessages = [];
+            
+            // 如果恢复成功，重置恢复尝试计数
+            this.recoveryAttempts = 0;
+            
+            this.app.utils.logger.info('消息检测系统恢复完成');
+        } catch (error) {
+            this.app.utils.logger.error('恢复消息检测系统失败', error);
+        }
     }
 }
 
@@ -14305,46 +14338,81 @@ class KeywordRuleManager {
         // 添加远程控制引用
         remoteController: null,
         settings: null,
-        followUpManager: null
+        followUpManager: null,
+        // 添加初始化状态标记
+        initializing: false,
+        startupErrors: [],
+        componentStatus: {}
     };
 
     // 初始化函数
     async function initialize() {
+        // 防止重复初始化
+        if (app.initializing) {
+            console.log('初始化已在进行中，请等待...');
+            return false;
+        }
+        if (app.initialized) {
+            console.log('已经初始化完成，无需重复初始化');
+            return true;
+        }
+
+        app.initializing = true;
+        app.startupErrors = [];
+        app.componentStatus = {
+            utils: false,
+            config: false,
+            remoteControl: false,
+            core: false,
+            ui: false
+        };
+
         try {
             console.log('小红书私信自动回复助手: 正在初始化...');
 
             // 1. 加载工具类
             const utilsLoaded = await loadUtils();
             if (!utilsLoaded) {
+                app.startupErrors.push('工具类加载失败');
                 throw new Error('工具类加载失败');
             }
+            app.componentStatus.utils = true;
 
             // 2. 加载配置
             const configLoaded = await loadConfig();
             if (!configLoaded) {
+                app.startupErrors.push('配置加载失败');
                 throw new Error('配置加载失败');
             }
+            app.componentStatus.config = true;
 
             // 3. 加载远程控制模块
             const remoteControlLoaded = await loadRemoteControl();
             if (!remoteControlLoaded) {
                 app.utils.logger.warn('远程控制模块加载失败，将使用本地控制');
+            } else {
+                app.componentStatus.remoteControl = true;
             }
 
             // 4. 加载核心功能
             const coreLoaded = await loadCore();
             if (!coreLoaded) {
+                app.startupErrors.push('核心功能加载失败');
                 throw new Error('核心功能加载失败');
             }
+            app.componentStatus.core = true;
 
             // 5. 加载UI
             const uiLoaded = await loadUI();
             if (!uiLoaded) {
+                app.startupErrors.push('UI加载失败');
                 throw new Error('UI加载失败');
             }
+            app.componentStatus.ui = true;
 
             // 6. 初始化完成
             app.initialized = true;
+            app.initializing = false;
             app.utils.logger.info('初始化完成');
 
             // 7. 检查远程控制状态，如果远程控制已启用并且允许脚本运行，或者远程控制未启用，则启动脚本
@@ -14354,8 +14422,10 @@ class KeywordRuleManager {
                 const remoteStatus = app.config.getSetting('remoteControl.status.enabled', true);
                 
                 if (!remoteControlEnabled || remoteStatus) {
-                    app.core.messageDetector.start();
-                    app.utils.logger.info('已自动启动消息监听');
+                    // 延迟启动以确保其他组件完全就绪
+                    setTimeout(() => {
+                        startMessageDetection();
+                    }, 1000);
                 } else {
                     const message = app.config.getSetting('remoteControl.status.message', '脚本已被远程禁用');
                     app.utils.logger.info(`自动启动被远程控制阻止: ${message}`);
@@ -14372,11 +14442,44 @@ class KeywordRuleManager {
             app.followUpManager = new FollowUpManager(app);
             await app.followUpManager.init();
 
+            return true;
         } catch (error) {
             console.error('小红书私信自动回复助手: 初始化失败', error);
             if (app.utils && app.utils.logger) {
                 app.utils.logger.error('初始化失败', error);
             }
+            app.initializing = false;
+            return false;
+        }
+    }
+
+    /**
+     * 安全启动消息检测
+     */
+    function startMessageDetection() {
+        try {
+            // 双重检查确保所有依赖组件已初始化
+            if (!app.initialized) {
+                app.utils.logger.warn('应用尚未初始化完成，无法启动消息检测');
+                return false;
+            }
+
+            if (!app.core || !app.core.messageDetector) {
+                app.utils.logger.error('消息检测器未初始化，无法启动');
+                return false;
+            }
+
+            // 启动消息检测
+            const result = app.core.messageDetector.start();
+            if (result) {
+                app.utils.logger.info('消息检测成功启动');
+            } else {
+                app.utils.logger.error('消息检测启动失败');
+            }
+            return result;
+        } catch (error) {
+            app.utils.logger.error('启动消息检测时发生错误', error);
+            return false;
         }
     }
 
@@ -14541,47 +14644,20 @@ class KeywordRuleManager {
         try {
             console.log('小红书私信自动回复助手: UI加载中...');
 
-            // 1. 创建控制面板实例
-            // ControlPanel 类应该在构建时已包含
-            const panel = new ControlPanel(app);
-            await panel.initialize();
-
-            // 2. 创建设置面板实例
+            // 1. 创建设置面板
             // SettingsPanel 类应该在构建时已包含
-            const settings = new SettingsPanel(app);
-            await settings.initialize();
+            const settingsPanel = new SettingsPanel(app);
+            await settingsPanel.initialize();
 
-            // 3. 创建关键词规则管理模块实例
-            // KeywordRuleManager 类应该在构建时已包含
-            const keywordRuleManager = new KeywordRuleManager(app);
-            await keywordRuleManager.initialize();
-
-            // 在设置面板中添加关键词规则部分
-            if (settings.panel) {
-                const form = settings.panel.querySelector('.xhs-auto-reply-settings-form');
-                if (form) {
-                    keywordRuleManager.createRuleSection(form);
-                }
-            }
-
-            // 4. 在设置面板中添加获客工具设置
-            if (settings.panel && app.leadGeneration) { // 确保 app.leadGeneration 已初始化
-                const leadSection = settings.panel.querySelector('#xhs-auto-reply-settings-section-lead');
-                if (leadSection) {
-                    app.leadGeneration.createLeadGenerationSection(leadSection); // 调用实例方法
-                } else {
-                     app.utils.logger.warn('未找到获客工具设置区域的容器');
-                }
-            } else if (!app.leadGeneration) {
-                 app.utils.logger.warn('获客工具处理模块未初始化，无法创建设置区域');
-            }
-
+            // 2. 创建控制面板
+            // ControlPanel 类应该在构建时已包含
+            const controlPanel = new ControlPanel(app);
+            await controlPanel.initialize();
 
             // 设置UI对象
             app.ui = {
-                panel,
-                settings,
-                keywordRuleManager
+                settingsPanel,
+                controlPanel
             };
 
             app.utils.logger.info('UI加载完成');
@@ -14592,11 +14668,12 @@ class KeywordRuleManager {
         }
     }
 
-    // 检查是否在小红书私信页面
+    // 检查是否在私信页面
     function isInMessagePage() {
-        return window.location.href.includes('xiaohongshu.com') &&
-               (window.location.href.includes('/messages') ||
-                window.location.href.includes('/im'));
+        return (
+            window.location.href.includes('xiaohongshu.com/im') || 
+            window.location.href.includes('xiaohongshu.com/message')
+        );
     }
 
     // 等待页面加载完成
@@ -14612,17 +14689,53 @@ class KeywordRuleManager {
 
     // 主函数
     async function main() {
-        await waitForPageLoad();
+        try {
+            await waitForPageLoad();
 
-        if (isInMessagePage()) {
-            console.log('小红书私信自动回复助手: 检测到私信页面，开始初始化...');
-            await initialize();
-        } else {
-            console.log('小红书私信自动回复助手: 非私信页面，跳过初始化');
+            // 如果不在私信页面，则不初始化
+            if (!isInMessagePage()) {
+                console.log('小红书私信自动回复助手: 当前不在私信页面，不进行初始化');
+                return;
+            }
+
+            // 延迟初始化，确保页面完全加载
+            setTimeout(async () => {
+                // 尝试初始化
+                const success = await initialize();
+                if (!success) {
+                    console.error('小红书私信自动回复助手: 初始化失败，请刷新页面重试');
+                    
+                    // 添加重试机制
+                    if (app.startupErrors && app.startupErrors.length > 0) {
+                        console.error('初始化错误列表:', app.startupErrors);
+                    }
+                    
+                    // 尝试再次初始化，最多3次
+                    let retryCount = 0;
+                    const maxRetries = 3;
+                    const retryInterval = 5000; // 5秒
+                    
+                    const retryInitialize = async () => {
+                        if (retryCount >= maxRetries || app.initialized) return;
+                        
+                        retryCount++;
+                        console.log(`小红书私信自动回复助手: 尝试重新初始化 (${retryCount}/${maxRetries})...`);
+                        
+                        const retrySuccess = await initialize();
+                        if (!retrySuccess && retryCount < maxRetries) {
+                            setTimeout(retryInitialize, retryInterval);
+                        }
+                    };
+                    
+                    setTimeout(retryInitialize, retryInterval);
+                }
+            }, 2000); // 延迟2秒初始化
+        } catch (error) {
+            console.error('小红书私信自动回复助手: 主函数执行失败', error);
         }
     }
 
-    // 启动脚本
+    // 启动
     main();
 
 })();

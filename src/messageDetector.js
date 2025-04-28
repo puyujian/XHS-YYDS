@@ -20,6 +20,11 @@ class MessageDetector {
             processedMessages: new Set(),
             lastCheckTime: 0
         };
+        // 添加消息处理失败计数器
+        this.failedMessagesCount = 0;
+        this.maxConsecutiveFailures = 5; // 允许的最大连续失败次数
+        this.recoveryAttempts = 0; // 恢复尝试次数
+        this.maxRecoveryAttempts = 3; // 最大恢复尝试次数
     }
 
     /**
@@ -39,6 +44,10 @@ class MessageDetector {
                 clearTimeout(this.switchContactTimeout);
                 this.switchContactTimeout = null;
             }
+
+            // 重置失败计数器
+            this.failedMessagesCount = 0;
+            this.recoveryAttempts = 0;
 
             // 等待页面加载完成
             await this.waitForPageElements();
@@ -106,6 +115,10 @@ class MessageDetector {
             // 清除之前的处理状态
             this.lastProcessedMessages.clear();
             this.app.utils.logger.debug('清除先前处理的消息缓存');
+
+            // 重置失败计数器
+            this.failedMessagesCount = 0;
+            this.recoveryAttempts = 0;
 
             // 开始监听联系人变化
             this.startContactListObserver();
@@ -374,38 +387,25 @@ class MessageDetector {
      * 启动消息观察器
      */
     startMessageObserver() {
-        this.app.utils.logger.debug('启动消息观察');
+        // 检查备份方法是否存在
+        if (!this.app.utils.dom.observeMessageList) {
+            this.app.utils.logger.error('消息观察器方法不存在，将使用备用检查机制');
+            return;
+        }
 
-        // 监听消息列表变化
-        this.observer = this.app.utils.dom.observeMessageList((newMessages, removedMessages) => {
-            // 添加更详细的日志
-            if (newMessages.length > 0) {
-                this.app.utils.logger.debug(`消息观察器检测到 ${newMessages.length} 条新消息`);
+        try {
+            // 开始观察消息列表
+            this.observer = this.app.utils.dom.observeMessageList((newMessages, removedMessages) => {
+                this.handleMessageListChange(newMessages, removedMessages);
+            });
 
-                // 记录消息类型信息
-                const msgTypes = new Set();
-                newMessages.forEach(msg => {
-                    const leftMsg = msg.querySelector(this.app.utils.dom.selectors.leftMessage);
-                    if (leftMsg) {
-                        const type = leftMsg.getAttribute('data-msg-type') || 'UNKNOWN';
-                        msgTypes.add(type);
-                    }
-                });
-
-                const typesStr = Array.from(msgTypes).join(', ');
-                if (typesStr) {
-                    this.app.utils.logger.debug(`消息类型：${typesStr}`);
-                }
+            if (!this.observer) {
+                this.app.utils.logger.warn('消息观察器创建失败，将依赖备用检查机制');
+            } else {
+                this.app.utils.logger.debug('消息观察器已启动');
             }
-
-            this.handleMessageListChange(newMessages, removedMessages);
-        });
-
-        // 检查是否成功设置观察器
-        if (this.observer) {
-            this.app.utils.logger.debug('消息观察器设置成功');
-        } else {
-            this.app.utils.logger.warn('消息观察器设置失败');
+        } catch (error) {
+            this.app.utils.logger.error('启动消息观察器失败，将使用备用检查机制', error);
         }
     }
 
@@ -452,7 +452,9 @@ class MessageDetector {
                 const leadTagText = hasLeadTag ? this.app.utils.dom.getText(tagElement) : '';
 
                 // 检查是否启用了忽略客资标签设置
-                const ignoreLeadTags = this.app.config.getSetting('reply.ignoreLeadTags', false);
+                const ignoreLeadTags = this.app.config && this.app.config.getSetting
+                    ? this.app.config.getSetting('reply.ignoreLeadTags', false)
+                    : false;
 
                 // 如果有客资标签且开启了忽略客资标签设置，则跳过该消息
                 if (hasLeadTag && ignoreLeadTags) {
@@ -529,20 +531,29 @@ class MessageDetector {
 
             this.app.utils.logger.debug(`处理消息类型: ${msgTypeAttr || 'UNKNOWN'}`);
 
-            if (msgTypeAttr === 'CARD') {
-                // 处理笔记卡片类型
+            if (msgType === 'CARD') {
+                // 处理卡片消息
                 messageType = 'CARD';
                 const cardContainer = leftMessageElement.querySelector(this.app.utils.dom.selectors.messageCardContainer);
-                if (cardContainer) {
-                    const titleElement = cardContainer.querySelector(this.app.utils.dom.selectors.messageCardTitle);
-                    messageTitle = titleElement ? titleElement.textContent.trim() : '未知笔记';
-                    messageText = `[笔记卡片] ${messageTitle}`;
-
-                    this.app.utils.logger.debug(`检测到笔记卡片: ${messageTitle}`);
-                } else {
-                    this.app.utils.logger.debug('未找到卡片容器元素');
+                if (!cardContainer) {
+                    this.app.utils.logger.debug('未找到卡片容器，无法处理');
                     return;
                 }
+
+                // 获取卡片标题
+                const titleElement = cardContainer.querySelector(this.app.utils.dom.selectors.messageCardTitle);
+                messageTitle = titleElement ? titleElement.textContent.trim() : '';
+
+                // 获取卡片信息
+                const infoElement = cardContainer.querySelector(this.app.utils.dom.selectors.messageCardInfo);
+                messageText = infoElement ? infoElement.textContent.trim() : messageTitle;
+
+                if (!messageText && !messageTitle) {
+                    this.app.utils.logger.debug('卡片内容为空，无法处理');
+                    return;
+                }
+
+                this.app.utils.logger.debug(`检测到卡片消息，标题: ${messageTitle}, 内容: ${messageText}`);
             } else if (messageElement.querySelector('.source-tip')) {
                 // 处理聚光进线消息
                 messageType = 'SPOTLIGHT';
@@ -636,12 +647,35 @@ class MessageDetector {
 
             // 处理消息
             try {
+                // 检查核心组件是否已初始化
+                if (!this.app.core || !this.app.core.messageHandler) {
+                    this.app.utils.logger.warn('消息处理器未初始化，跳过消息处理');
+                    this.failedMessagesCount++;
+                    if (this.failedMessagesCount >= this.maxConsecutiveFailures) {
+                        this.attemptRecovery();
+                    }
+                    return;
+                }
+
                 await this.app.core.messageHandler.handleMessage(message);
+                
+                // 成功处理消息，重置失败计数器
+                this.failedMessagesCount = 0;
             } catch (error) {
                 this.app.utils.logger.error('处理消息失败', error);
+                this.failedMessagesCount++;
+                
+                if (this.failedMessagesCount >= this.maxConsecutiveFailures) {
+                    this.attemptRecovery();
+                }
             }
         } catch (error) {
             this.app.utils.logger.error('处理新消息失败', error);
+            this.failedMessagesCount++;
+            
+            if (this.failedMessagesCount >= this.maxConsecutiveFailures) {
+                this.attemptRecovery();
+            }
         }
     }
 
@@ -844,5 +878,44 @@ class MessageDetector {
         
         // 确保返回的ID不为空
         return contactId || '未知ID';
+    }
+
+    /**
+     * 尝试恢复消息检测系统
+     */
+    async attemptRecovery() {
+        if (this.recoveryAttempts >= this.maxRecoveryAttempts) {
+            this.app.utils.logger.error(`已达到最大恢复尝试次数(${this.maxRecoveryAttempts})，放弃恢复`);
+            return;
+        }
+        
+        this.recoveryAttempts++;
+        this.app.utils.logger.warn(`检测到连续失败(${this.failedMessagesCount}次)，正在尝试恢复消息检测系统 (尝试 ${this.recoveryAttempts}/${this.maxRecoveryAttempts})`);
+        
+        try {
+            // 停止当前的观察器
+            if (this.observer) {
+                this.observer.disconnect();
+                this.observer = null;
+            }
+            
+            // 重置处理状态
+            this.lastProcessedMessages.clear();
+            this.failedMessagesCount = 0;
+            
+            // 重新启动消息观察器
+            this.startMessageObserver();
+            this.app.utils.logger.info('消息观察器已重新启动');
+            
+            // 清空并释放资源
+            this.pendingMessages = [];
+            
+            // 如果恢复成功，重置恢复尝试计数
+            this.recoveryAttempts = 0;
+            
+            this.app.utils.logger.info('消息检测系统恢复完成');
+        } catch (error) {
+            this.app.utils.logger.error('恢复消息检测系统失败', error);
+        }
     }
 }
