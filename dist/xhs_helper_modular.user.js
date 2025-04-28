@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小红书私信自动回复助手-模块化
 // @namespace    http://tampermonkey.net/
-// @version      0.2
+// @version      0.2.1
 // @description  小红书私信自动回复工具，支持AI回复，关键词触发，历史记忆和数据统计 (Modular Version)
 // @author       ChatGPT & You
 // @match        https://*.xiaohongshu.com/*

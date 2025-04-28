@@ -5,6 +5,7 @@ const JavaScriptObfuscator = require('javascript-obfuscator'); // 引入混淆�
 const srcDir = path.join(__dirname, 'src');
 const distDir = path.join(__dirname, 'dist');
 const outputFile = path.join(distDir, 'xhs_helper_modular.user.js');
+const metadataPath = path.join(srcDir, 'metadata.js');
 
 // 定义模块加载顺序，确保依赖关系正确
 const moduleOrder = [
@@ -55,6 +56,45 @@ const obfuscationOptions = {
     unicodeEscapeSequence: false // Unicode 转义序列
 };
 
+/**
+ * 解析并递增版本号
+ * @param {string} metadataContent - 元数据文件内容
+ * @returns {Object} - 包含更新后的元数据和版本号信息
+ */
+function updateVersionNumber(metadataContent) {
+    // 使用正则表达式从元数据中提取版本号
+    const versionMatch = metadataContent.match(/\/\/ @version\s+(\d+)\.(\d+)(?:\.(\d+))?/);
+    
+    if (!versionMatch) {
+        console.warn('警告: 无法解析版本号，将使用默认版本号 0.1.0');
+        return {
+            updatedMetadata: metadataContent.replace(
+                /\/\/ @version.*$/m,
+                '// @version      0.1.0'
+            ),
+            oldVersion: '未知',
+            newVersion: '0.1.0'
+        };
+    }
+    
+    // 解析版本号组件
+    const major = parseInt(versionMatch[1], 10);
+    const minor = parseInt(versionMatch[2], 10);
+    const patch = versionMatch[3] ? parseInt(versionMatch[3], 10) : 0;
+    
+    // 递增补丁版本号
+    const newPatch = patch + 1;
+    const oldVersion = `${major}.${minor}${patch ? '.' + patch : ''}`;
+    const newVersion = `${major}.${minor}.${newPatch}`;
+    
+    // 更新元数据中的版本号
+    const updatedMetadata = metadataContent.replace(
+        /\/\/ @version.*$/m,
+        `// @version      ${newVersion}`
+    );
+    
+    return { updatedMetadata, oldVersion, newVersion };
+}
 
 async function buildScript() {
     try {
@@ -71,14 +111,21 @@ async function buildScript() {
         }
 
         // 1. 读取元数据
-        const metadataPath = path.join(srcDir, 'metadata.js');
         if (!fs.existsSync(metadataPath)) {
             throw new Error(`元数据文件未找到: ${metadataPath}`);
         }
         const metadataContent = fs.readFileSync(metadataPath, 'utf8');
         console.log('读取元数据完成.');
+        
+        // 2. 更新版本号
+        const { updatedMetadata, oldVersion, newVersion } = updateVersionNumber(metadataContent);
+        console.log(`版本号更新: ${oldVersion} -> ${newVersion}`);
+        
+        // 3. 保存更新后的元数据
+        fs.writeFileSync(metadataPath, updatedMetadata, 'utf8');
+        console.log('元数据文件已更新.');
 
-        // 2. 读取并合并模块文件
+        // 4. 读取并合并模块文件
         let combinedContent = '';
         for (const moduleFile of moduleOrder) {
             const modulePath = path.join(srcDir, moduleFile);
@@ -96,26 +143,27 @@ async function buildScript() {
         let finalCodeToUse;
 
         if (shouldObfuscate) {
-            // 3. 混淆合并后的代码
+            // 5. 混淆合并后的代码
             console.log('开始混淆代码...');
             const obfuscatedCode = JavaScriptObfuscator.obfuscate(combinedContent, obfuscationOptions);
             finalCodeToUse = obfuscatedCode.getObfuscatedCode();
             console.log('代码混淆完成.');
         } else {
-            // 3. 跳过混淆
+            // 5. 跳过混淆
             console.log('跳过代码混淆步骤 (使用了 --no-obfuscate 参数)...');
             finalCodeToUse = combinedContent;
         }
 
-        // 4. 组合最终脚本内容 (元数据 + 处理后的代码)
-        const finalScriptContent = metadataContent + '\n\n' + finalCodeToUse;
+        // 6. 组合最终脚本内容 (元数据 + 处理后的代码)
+        const finalScriptContent = updatedMetadata + '\n\n' + finalCodeToUse;
 
-        // 5. 写入目标文件
+        // 7. 写入目标文件
         fs.writeFileSync(outputFile, finalScriptContent, 'utf8');
-        console.log(`构建并混淆成功！脚本已输出到: ${outputFile}`);
+        console.log(`构建完成！脚本已输出到: ${outputFile}`);
+        console.log(`当前版本: ${newVersion}`);
 
     } catch (error) {
-        console.error('构建或混淆失败:', error);
+        console.error('构建失败:', error);
         process.exit(1); // 构建失败时退出
     }
 }
